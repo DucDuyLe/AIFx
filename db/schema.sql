@@ -23,4 +23,80 @@ create table if not exists public.candles (
 create index if not exists candles_symbol_interval_time_idx
     on public.candles(symbol, interval, open_time desc);
 
+-- -------- FX 3-Agent full stack (see docs/FULL_STACK_SPEC.md) --------
+
+-- Optional: per-symbol, per-time features (Agent 1)
+create table if not exists public.features (
+    id bigint generated always as identity primary key,
+    symbol text not null,
+    ts timestamptz not null,
+    feature_json jsonb not null,
+    inserted_at timestamptz not null default now()
+);
+create index if not exists features_symbol_ts_idx on public.features(symbol, ts desc);
+
+-- Signal table: output of Agent 1 (base + delta)
+create table if not exists public.signals (
+    id bigint generated always as identity primary key,
+    symbol text not null,
+    ts timestamptz not null,
+    direction smallint not null check (direction in (-1, 0, 1)),
+    score numeric not null,
+    confidence numeric,
+    base_signal numeric,
+    news_delta numeric,
+    meta jsonb,
+    inserted_at timestamptz not null default now()
+);
+create index if not exists signals_symbol_ts_idx on public.signals(symbol, ts desc);
+
+-- Risk limits (Agent 2 reads)
+create table if not exists public.risk_config (
+    id bigint generated always as identity primary key,
+    key text unique not null,
+    value_json jsonb not null,
+    updated_at timestamptz not null default now()
+);
+
+-- Proposed orders: Agent 2 output, Agent 3 input
+create table if not exists public.proposed_orders (
+    id bigint generated always as identity primary key,
+    symbol text not null,
+    side text not null check (side in ('buy','sell')),
+    size numeric not null,
+    order_type text not null default 'market',
+    stop_loss numeric,
+    take_profit numeric,
+    signal_id bigint references public.signals(id),
+    status text not null default 'pending' check (status in ('pending','approved','rejected','sent','filled','cancelled')),
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+create index if not exists proposed_orders_status_idx on public.proposed_orders(status);
+
+-- Orders sent to broker (Agent 3)
+create table if not exists public.orders (
+    id bigint generated always as identity primary key,
+    proposed_order_id bigint references public.proposed_orders(id),
+    broker_order_id text,
+    symbol text not null,
+    side text not null,
+    size numeric not null,
+    filled_size numeric default 0,
+    status text not null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+-- Open positions (from broker / Agent 3)
+create table if not exists public.positions (
+    id bigint generated always as identity primary key,
+    symbol text not null,
+    side text not null,
+    size numeric not null,
+    entry_price numeric,
+    unrealized_pnl numeric,
+    updated_at timestamptz not null default now(),
+    unique(symbol)
+);
 
