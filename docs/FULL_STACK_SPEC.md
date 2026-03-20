@@ -1,6 +1,12 @@
-# Full-Stack Spec: Own Engine (FX Agent System)
+# Full-Stack Spec: Own Engine (Stock/FX Agent System)
 
-This doc describes how to build **your own full stack** for the forex AI trading system: backend, DB, agents, and broker integration — no QuantConnect dependency.
+This doc describes how to build **your own full stack** for an AI trading system: backend, DB, agents, and broker integration — no QuantConnect dependency.
+
+Default rollout path for this repo:
+
+1. **Phase 1:** Intraday liquid US stocks/ETFs in paper mode.
+2. **Phase 2:** Add controlled margin after gates pass.
+3. **Phase 3 (optional):** Add FX connectors and macro handling.
 
 ### 3-Agent vs 4-Agent Layout
 
@@ -66,15 +72,15 @@ If you prefer the **4-agent** split, use: **Agent 1 = Data/News only** (writes c
 | Backend     | Python, FastAPI      | Async, Pydantic; add routes for signals, risk, orders. |
 | Database    | Postgres (Supabase/Neon) | Extend schema with `signals`, `features`, `orders`, `positions`, `risk_config`. |
 | Cache       | Redis (Upstash)      | Cache latest quotes, throttle external APIs. |
-| Data        | FX price API + news API | OANDA/cTrader for prices; news/sentiment as in plan (or LLM). |
-| Execution   | Broker API          | OANDA, Pepperstone cTrader, or IBKR — one connector to start. |
+| Data        | Stock/FX price API + news API | Polygon/Alpaca for stocks, OANDA/cTrader for FX; news/sentiment as in plan (or LLM). |
+| Execution   | Broker API          | **IBKR paper first** for stocks; OANDA/cTrader reserved for later FX phase. |
 | Deploy      | Vercel (frontend), Railway (backend + workers) | Same as plan. |
 
 ---
 
 ## 3. Database Schema (Additions for FX 3-Agent Flow)
 
-Keep your existing `candles` table; use it for FX by adding FX pairs and an `interval` like `5m`. Add these tables:
+Keep your existing `candles` table; use it for stocks or FX with an `interval` like `5m`. Add these tables:
 
 ```sql
 -- Optional: store per-symbol, per-time features (from Agent 1)
@@ -271,6 +277,6 @@ Start with **Option A**; move to B or C when you need it.
 - **Agent 1** fills `signals` from data APIs + a simple ranking model (and optional news delta).
 - **Agent 2** reads `signals` and risk config, writes `proposed_orders` (sizing + SL/TP).
 - **Agent 3** reads `proposed_orders`, talks to the broker, updates `orders` and `positions`.
-- Build in order: schema + API → Agent 1 → Agent 2 → Agent 3 (paper) → UI → live with small size.
+- Build in order: schema + API -> Agent 1 -> Agent 2 -> Agent 3 (paper) -> UI -> live micro-size -> controlled margin -> optional FX.
 
 If you want, next step can be: **add the new tables to your repo’s `db/schema.sql`** and a **minimal FastAPI app** with the routes above so you can start implementing the agents.

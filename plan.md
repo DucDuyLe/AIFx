@@ -11,7 +11,7 @@ Tagline: Agentic analytics and predictive signals for modern markets.
 - **Backend**: Python, FastAPI, async HTTP, pydantic
 - **Database**: Postgres (Supabase/Neon) with TimescaleDB + pgvector
 - **Cache**: Redis (Upstash)
-- **Data Providers**: Binance (crypto intraday for prototyping), Polygon.io later for equities
+- **Data Providers**: Polygon.io/Alpaca for intraday stocks in Phase 1, optional FX connectors (OANDA/cTrader) in a later phase
 - **CI/CD & Deploy**: GitHub → Vercel (frontend), Railway (backend)
 - **Design**: Midjourney (concepts), Figma (wireframes → components)
 
@@ -19,9 +19,9 @@ Tagline: Agentic analytics and predictive signals for modern markets.
 - **Week 1**: Foundation — repos, schema draft, design alignment
 - **Week 2**: Data & API prototype — ingest OHLCV, serve candles, chart in UI
 - **Week 3**: Prediction — simple model + LLM explanation, /api/predict wired to UI
-- **Week 4**: Strategy & Backtest — /api/backtest, metrics, visualization
+- **Week 4**: Strategy & Backtest — /api/backtest, metrics, visualization, risk-gate auditing
 - **Week 5**: Agent & RAG — chat sidebar, pgvector search, polish
-- **Week 6**: Test, deploy, launch — public demo, landing page, video
+- **Week 6**: Test, deploy, launch — public demo, landing page, video, paper->live promotion review
 
 ### Weekly Plan (Detailed)
 
@@ -81,6 +81,9 @@ Deliverables: Public demo URL, README, video walkthrough
 - `POST /api/predict` — { symbols: string[], horizon: "1d" | "1w" } → scores, confidence, reasoning
 - `POST /api/backtest` — { strategy: string, universe: string[], params: json, from, to } → metrics, equity curve
 - `POST /api/rag/search` — { query: string, k?: number } → passages with citations
+- `GET /api/risk/config` — current risk and margin controls
+- `POST /api/risk/proposed-orders` — Agent 2 output with pre-trade checks
+- `POST /api/control/live-trading` — execution kill switch
 
 ### Database Sketch
 - `users(id, email, name, created_at)`

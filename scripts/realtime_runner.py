@@ -8,6 +8,8 @@ Realtime runner supporting delayed or live modes with Polygon or Alpaca data.
 
 - Execution (optional):
   - Alpaca paper REST (requires APCA_API_KEY_ID, APCA_API_SECRET_KEY, APCA_API_BASE_URL)
+  - IBKR paper is the default target path for this project; if selected here, orders are logged
+    as "approved-but-not-sent" placeholders until a dedicated IBKR connector is added.
 
 Typical usage (PowerShell):
   # Delayed data (free tiers), no orders, check last closed 5m bar
@@ -22,13 +24,14 @@ Typical usage (PowerShell):
 from __future__ import annotations
 
 import argparse
-import math
+import csv
 import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -81,6 +84,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--paper", action="store_true", help="Enable Alpaca paper order placement")
     p.add_argument("--demo-strategy", action="store_true", help="Place sample orders: buy if close>open, sell if close<open")
     p.add_argument("--request-delay-ms", type=int, default=200, help="Delay between HTTP calls")
+    p.add_argument("--broker-target", choices=["ibkr", "alpaca"], default="ibkr", help="Execution target path (default: ibkr)")
+    p.add_argument("--enforce-session", action="store_true", help="Block orders outside configured market session")
+    p.add_argument("--session-tz", default="America/New_York", help="Session timezone name")
+    p.add_argument("--session-start", default="09:30", help="Session start HH:MM")
+    p.add_argument("--session-end", default="16:00", help="Session end HH:MM")
+    p.add_argument("--skip-open-minutes", type=int, default=5, help="Skip first N minutes after session open")
+    p.add_argument("--skip-close-minutes", type=int, default=10, help="Skip last N minutes before session close")
+    p.add_argument("--max-orders-per-cycle", type=int, default=4, help="Simple exposure cap per cycle")
+    p.add_argument("--max-spread-bps", type=float, default=8.0, help="Reject if spread proxy exceeds this threshold")
+    p.add_argument("--max-slippage-bps", type=float, default=12.0, help="Reject if estimated slippage exceeds this threshold")
+    p.add_argument("--metrics-csv", default="data/execution_metrics.csv", help="Path to append execution metrics rows")
     return p.parse_args()
 
 
@@ -233,6 +247,14 @@ class Bar:
     volume: float
 
 
+@dataclass
+class SendGateResult:
+    ok: bool
+    reason: str
+    spread_bps: float
+    est_slippage_bps: float
+
+
 def normalize_bars(raw: Dict[str, Dict]) -> List[Bar]:
     bars: List[Bar] = []
     for sym, d in raw.items():
@@ -262,7 +284,92 @@ def demo_signal(bar: Bar) -> Optional[Tuple[str, int]]:
     return None
 
 
-def run_once(symbols: List[str], interval: str, data_source: str, mode: str, request_delay_ms: int, polygon_key: Optional[str], paper: bool, demo_strategy: bool) -> None:
+def _parse_hhmm(value: str) -> Tuple[int, int]:
+    hh, mm = value.split(":")
+    return int(hh), int(mm)
+
+
+def in_allowed_session(
+    now_dt: datetime,
+    session_tz: str,
+    session_start: str,
+    session_end: str,
+    skip_open_minutes: int,
+    skip_close_minutes: int,
+) -> Tuple[bool, str]:
+    local = now_dt.astimezone(ZoneInfo(session_tz))
+    if local.weekday() >= 5:
+        return (False, "weekend")
+
+    start_h, start_m = _parse_hhmm(session_start)
+    end_h, end_m = _parse_hhmm(session_end)
+    start_dt = local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+    end_dt = local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+
+    if local < start_dt or local >= end_dt:
+        return (False, "outside_session")
+    if local < start_dt + timedelta(minutes=skip_open_minutes):
+        return (False, "open_buffer")
+    if local >= end_dt - timedelta(minutes=skip_close_minutes):
+        return (False, "close_buffer")
+    return (True, "ok")
+
+
+def spread_proxy_bps(bar: Bar) -> float:
+    if bar.close <= 0:
+        return float("inf")
+    return ((bar.high - bar.low) / bar.close) * 10000.0
+
+
+def estimate_slippage_bps(bar: Bar) -> float:
+    if bar.close <= 0:
+        return float("inf")
+    # Proxy estimate for demo runner: small fraction of bar body with a floor.
+    body_bps = abs(bar.close - bar.open_) / bar.close * 10000.0
+    return max(0.5, body_bps * 0.10)
+
+
+def evaluate_send_gate(bar: Bar, args: argparse.Namespace) -> SendGateResult:
+    spread_bps = spread_proxy_bps(bar)
+    est_slippage_bps = estimate_slippage_bps(bar)
+    if spread_bps > args.max_spread_bps:
+        return SendGateResult(False, "spread_block", spread_bps, est_slippage_bps)
+    if est_slippage_bps > args.max_slippage_bps:
+        return SendGateResult(False, "slippage_block", spread_bps, est_slippage_bps)
+    return SendGateResult(True, "ok", spread_bps, est_slippage_bps)
+
+
+def append_metric_row(path: str, row: Dict[str, object]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    exists = os.path.exists(path)
+    fieldnames = [
+        "ts_utc",
+        "symbol",
+        "event_type",
+        "reason",
+        "spread_bps",
+        "est_slippage_bps",
+        "broker_target",
+        "order_id",
+    ]
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def run_once(
+    symbols: List[str],
+    interval: str,
+    data_source: str,
+    mode: str,
+    request_delay_ms: int,
+    polygon_key: Optional[str],
+    paper: bool,
+    demo_strategy: bool,
+    args: argparse.Namespace,
+) -> None:
     if data_source == "polygon":
         if not polygon_key:
             print("POLYGON_API_KEY required for polygon data")
@@ -276,16 +383,99 @@ def run_once(symbols: List[str], interval: str, data_source: str, mode: str, req
     print(f"Fetched {len(bars)} bars @ {datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime(ISO_FORMAT)}")
     if not demo_strategy:
         return
-    # Place sample orders if enabled
-    if paper:
-        for b in bars:
-            sig = demo_signal(b)
-            if not sig:
-                continue
-            side, qty = sig
+    allowed = True
+    session_reason = "ok"
+    if args.enforce_session:
+        allowed, session_reason = in_allowed_session(
+            now_dt=now_utc(),
+            session_tz=args.session_tz,
+            session_start=args.session_start,
+            session_end=args.session_end,
+            skip_open_minutes=args.skip_open_minutes,
+            skip_close_minutes=args.skip_close_minutes,
+        )
+
+    sent_count = 0
+    for b in bars:
+        sig = demo_signal(b)
+        if not sig:
+            continue
+        side, qty = sig
+        if sent_count >= args.max_orders_per_cycle:
+            print(f"{b.symbol}: {side} x{qty} -> blocked(max_orders_per_cycle)")
+            append_metric_row(
+                args.metrics_csv,
+                {
+                    "ts_utc": now_utc().isoformat(),
+                    "symbol": b.symbol,
+                    "event_type": "risk_blocked",
+                    "reason": "max_orders_per_cycle",
+                    "spread_bps": "",
+                    "est_slippage_bps": "",
+                    "broker_target": args.broker_target,
+                    "order_id": "",
+                },
+            )
+            continue
+        if not allowed:
+            print(f"{b.symbol}: {side} x{qty} -> blocked({session_reason})")
+            append_metric_row(
+                args.metrics_csv,
+                {
+                    "ts_utc": now_utc().isoformat(),
+                    "symbol": b.symbol,
+                    "event_type": "session_blocked",
+                    "reason": session_reason,
+                    "spread_bps": "",
+                    "est_slippage_bps": "",
+                    "broker_target": args.broker_target,
+                    "order_id": "",
+                },
+            )
+            continue
+
+        gate = evaluate_send_gate(b, args)
+        if not gate.ok:
+            print(f"{b.symbol}: {side} x{qty} -> blocked({gate.reason}) spread={gate.spread_bps:.2f}bps est_slip={gate.est_slippage_bps:.2f}bps")
+            append_metric_row(
+                args.metrics_csv,
+                {
+                    "ts_utc": now_utc().isoformat(),
+                    "symbol": b.symbol,
+                    "event_type": "risk_blocked",
+                    "reason": gate.reason,
+                    "spread_bps": f"{gate.spread_bps:.4f}",
+                    "est_slippage_bps": f"{gate.est_slippage_bps:.4f}",
+                    "broker_target": args.broker_target,
+                    "order_id": "",
+                },
+            )
+            continue
+
+        order_id: Optional[str] = None
+        if args.broker_target == "alpaca" and paper:
             order_id = alpaca_paper_order(b.symbol, side, qty)
-            status = order_id or "rejected"
-            print(f"{b.symbol}: {side} x{qty} -> {status}")
+        elif args.broker_target == "ibkr":
+            # Placeholder for IBKR paper connector integration.
+            order_id = "ibkr_paper_placeholder"
+
+        event_type = "sent" if order_id else "rejected"
+        status = order_id or "rejected"
+        sent_count += 1 if order_id else 0
+        print(f"{b.symbol}: {side} x{qty} -> {status} spread={gate.spread_bps:.2f}bps est_slip={gate.est_slippage_bps:.2f}bps")
+        append_metric_row(
+            args.metrics_csv,
+            {
+                "ts_utc": now_utc().isoformat(),
+                "symbol": b.symbol,
+                "event_type": event_type,
+                "reason": "ok" if order_id else "broker_reject_or_disabled",
+                "spread_bps": f"{gate.spread_bps:.4f}",
+                "est_slippage_bps": f"{gate.est_slippage_bps:.4f}",
+                "broker_target": args.broker_target,
+                "order_id": order_id or "",
+            },
+        )
 
 
 def main() -> None:
@@ -295,7 +485,7 @@ def main() -> None:
     step_seconds = INTERVAL_TO_SECONDS[args.interval]
 
     if args.once:
-        run_once(symbols, args.interval, args.data_source, args.mode, args.request_delay_ms, polygon_key, args.paper, args.demo_strategy)
+        run_once(symbols, args.interval, args.data_source, args.mode, args.request_delay_ms, polygon_key, args.paper, args.demo_strategy, args)
         return
 
     # Align to bar-close and loop
@@ -308,7 +498,7 @@ def main() -> None:
         if sleep_s > 0:
             time.sleep(sleep_s)
         try:
-            run_once(symbols, args.interval, args.data_source, args.mode, args.request_delay_ms, polygon_key, args.paper, args.demo_strategy)
+            run_once(symbols, args.interval, args.data_source, args.mode, args.request_delay_ms, polygon_key, args.paper, args.demo_strategy, args)
         except KeyboardInterrupt:
             print("Interrupted.")
             sys.exit(130)

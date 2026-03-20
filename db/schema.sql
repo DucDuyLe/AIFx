@@ -58,6 +58,16 @@ create table if not exists public.risk_config (
     updated_at timestamptz not null default now()
 );
 
+-- Optional promotion gates for paper -> live -> margin progression
+create table if not exists public.promotion_gates (
+    id bigint generated always as identity primary key,
+    gate_name text unique not null,
+    phase text not null check (phase in ('paper','live','margin')),
+    is_enabled boolean not null default true,
+    threshold_json jsonb not null,
+    updated_at timestamptz not null default now()
+);
+
 -- Proposed orders: Agent 2 output, Agent 3 input
 create table if not exists public.proposed_orders (
     id bigint generated always as identity primary key,
@@ -69,6 +79,8 @@ create table if not exists public.proposed_orders (
     take_profit numeric,
     signal_id bigint references public.signals(id),
     status text not null default 'pending' check (status in ('pending','approved','rejected','sent','filled','cancelled')),
+    reject_reason text,
+    risk_checks jsonb,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -83,6 +95,11 @@ create table if not exists public.orders (
     side text not null,
     size numeric not null,
     filled_size numeric default 0,
+    avg_fill_price numeric,
+    expected_price numeric,
+    slippage_bps numeric,
+    fee_amount numeric default 0,
+    fee_currency text,
     status text not null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -99,4 +116,18 @@ create table if not exists public.positions (
     updated_at timestamptz not null default now(),
     unique(symbol)
 );
+
+-- Agent 3 execution quality events (used by margin promotion gates)
+create table if not exists public.execution_events (
+    id bigint generated always as identity primary key,
+    ts timestamptz not null default now(),
+    symbol text,
+    event_type text not null check (event_type in ('sent','rejected','filled','risk_blocked','session_blocked')),
+    proposed_order_id bigint references public.proposed_orders(id),
+    order_id bigint references public.orders(id),
+    reason text,
+    meta jsonb
+);
+create index if not exists execution_events_ts_idx on public.execution_events(ts desc);
+create index if not exists execution_events_type_ts_idx on public.execution_events(event_type, ts desc);
 
