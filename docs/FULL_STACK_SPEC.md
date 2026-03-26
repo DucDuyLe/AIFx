@@ -8,6 +8,12 @@ Default rollout path for this repo:
 2. **Phase 2:** Add controlled margin after gates pass.
 3. **Phase 3 (optional):** Add FX connectors and macro handling.
 
+Alternative rollout (if your priority is scalping + automation speed):
+
+1. **Phase 1 (Alt):** FX scalping in paper/demo with an API-friendly broker (e.g. OANDA), strict spread/news/session filters.
+2. **Phase 2 (Alt):** Live micro-size with hard daily loss halts.
+3. **Phase 3 (Alt):** Expand to stocks once the pipeline is stable.
+
 ### 3-Agent vs 4-Agent Layout
 
 We originally had **4 agents** in mind:
@@ -62,6 +68,11 @@ If you prefer the **4-agent** split, use: **Agent 1 = Data/News only** (writes c
 - **Backend**: Single source of truth. All agents read/write via the API or directly to the DB (you choose).
 - **Agents**: Can be separate processes (e.g. cron jobs or queue workers) that call the backend or DB; or they can live inside the backend as scheduled tasks.
 
+Two execution modes (recommended to support both):
+
+- **Auto**: Agent 3 can send orders immediately when risk checks pass.
+- **Semi-auto (Action Center style)**: Agent 2 creates `proposed_orders` and a human must approve before Agent 3 sends. This is similar to the “Action Center” pattern in execution platforms.
+
 ---
 
 ## 2. Tech Stack (Aligned With Your Plan)
@@ -78,7 +89,7 @@ If you prefer the **4-agent** split, use: **Agent 1 = Data/News only** (writes c
 
 ---
 
-## 3. Database Schema (Additions for FX 3-Agent Flow)
+## 3. Database Schema (Trading System Core)
 
 Keep your existing `candles` table; use it for stocks or FX with an `interval` like `5m`. Add these tables:
 
@@ -116,6 +127,17 @@ create table if not exists public.risk_config (
     updated_at timestamptz not null default now()
 );
 
+-- Optional: gates to control paper -> live -> margin promotions
+-- (keeps your rollout disciplined and prevents “turning on margin early”)
+create table if not exists public.promotion_gates (
+    id bigint generated always as identity primary key,
+    gate_name text unique not null,
+    phase text not null check (phase in ('paper','live','margin')),
+    is_enabled boolean not null default true,
+    threshold_json jsonb not null,
+    updated_at timestamptz not null default now()
+);
+
 -- Proposed orders: output of Agent 2, input to Agent 3
 create table if not exists public.proposed_orders (
     id bigint generated always as identity primary key,
@@ -127,6 +149,8 @@ create table if not exists public.proposed_orders (
     take_profit numeric,
     signal_id bigint references public.signals(id),
     status text not null default 'pending' check (status in ('pending','approved','rejected','sent','filled','cancelled')),
+    reject_reason text,
+    risk_checks jsonb,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -141,6 +165,11 @@ create table if not exists public.orders (
     side text not null,
     size numeric not null,
     filled_size numeric default 0,
+    avg_fill_price numeric,
+    expected_price numeric,
+    slippage_bps numeric,
+    fee_amount numeric default 0,
+    fee_currency text,
     status text not null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -157,6 +186,19 @@ create table if not exists public.positions (
     updated_at timestamptz not null default now(),
     unique(symbol)
 );
+
+-- Append-only execution/audit events for monitoring + post-loss review
+create table if not exists public.execution_events (
+    id bigint generated always as identity primary key,
+    ts timestamptz not null default now(),
+    symbol text,
+    event_type text not null check (event_type in ('sent','rejected','filled','risk_blocked','session_blocked')),
+    proposed_order_id bigint references public.proposed_orders(id),
+    order_id bigint references public.orders(id),
+    reason text,
+    meta jsonb
+);
+create index execution_events_ts_idx on public.execution_events(ts desc);
 ```
 
 You can add `account_snapshots` (equity, balance over time) later for risk and reporting.
@@ -217,6 +259,11 @@ You can add `account_snapshots` (equity, balance over time) later for risk and r
   3. Insert rows into `proposed_orders` with status `pending`.
 - **Output**: `proposed_orders` table. Still no broker calls.
 
+Hard caps (non-negotiables you described):
+
+- **Per-trade risk cap**: max `3u` per trade (Agent 2 must never propose beyond this).
+- **Daily loss cap**: max `7u` per day (Agent 2 must stop proposing new entries once hit).
+
 ### Agent 3: Execution & Monitoring
 
 - **Runs**: On a short interval (e.g. every 30 s) or via queue.
@@ -224,10 +271,14 @@ You can add `account_snapshots` (equity, balance over time) later for risk and r
 - **Logic**:
   1. If live trading is disabled, skip or only log.
   2. Fetch `proposed_orders` with status `approved` (or auto-approve if you want full automation).
-  3. For each order: check spread, slippage, daily loss limit again → then call broker API to place order.
+  3. For each order: check **session**, **spread**, **slippage**, **daily loss**, **duplicate/idempotency** again → then call broker API to place order.
   4. Update `proposed_orders.status` to `sent`, and insert into `orders` with `broker_order_id`.
   5. Periodically poll broker for fills and update `orders` and `positions`.
 - **Output**: Real orders in the broker; DB tables `orders` and `positions` updated.
+
+Post-loss review loop:
+
+- When daily loss reaches `7u`: halt for the day and generate a review artifact from `execution_events` + `orders` + `proposed_orders` (what happened, why, and how to improve the model/rules).
 
 ---
 
