@@ -1,10 +1,24 @@
 -- Seed defaults for stock-first intraday rollout (Phase 1 -> Phase 2)
--- Run after db/schema.sql
+-- Run after db/schema.sql (or db/migrations/001_initial_schema.sql)
 
+-- Initial symbol universe
+insert into public.instruments (symbol, asset_type, exchange, name) values
+    ('SPY',  'etf',       'ARCA',   'SPDR S&P 500 ETF Trust'),
+    ('AMD',  'us_equity', 'NASDAQ', 'Advanced Micro Devices Inc.'),
+    ('AAPL', 'us_equity', 'NASDAQ', 'Apple Inc.'),
+    ('MSFT', 'us_equity', 'NASDAQ', 'Microsoft Corporation'),
+    ('NVDA', 'us_equity', 'NASDAQ', 'NVIDIA Corporation'),
+    ('AMZN', 'us_equity', 'NASDAQ', 'Amazon.com Inc.')
+on conflict (symbol) do update set
+    asset_type = excluded.asset_type,
+    exchange = excluded.exchange,
+    name = excluded.name;
+
+-- Risk config defaults
 insert into public.risk_config (key, value_json) values
     ('trading_mode', '{"phase":"paper"}'::jsonb),
     ('live_trading_enabled', '{"enabled":false}'::jsonb),
-    ('symbol_universe', '{"symbols":["SPY","QQQ","AAPL","MSFT","NVDA","AMZN"]}'::jsonb),
+    ('symbol_universe', '{"symbols":["SPY","AMD","AAPL","MSFT","NVDA","AMZN"]}'::jsonb),
     ('session_filter', '{"timezone":"America/New_York","start":"09:30","end":"16:00","skip_open_minutes":5,"skip_close_minutes":10}'::jsonb),
     ('max_risk_pct_per_trade', '{"value":0.35}'::jsonb),
     ('max_daily_loss_pct', '{"value":1.50}'::jsonb),

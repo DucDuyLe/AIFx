@@ -1,5 +1,6 @@
 requests>=2.32.0
 psycopg2-binary>=2.9.9
+python-dotenv>=1.0.1
 beautifulsoup4>=4.12.3
 
 # ML & data
@@ -8,4 +9,8 @@ numpy>=1.26.4
 scikit-learn>=1.5.1
 pyarrow>=16.1.0
 joblib>=1.4.2
+
+# NLP / sentiment
+transformers>=4.40
+torch>=2.2
 
