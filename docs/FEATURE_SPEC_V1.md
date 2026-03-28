@@ -51,6 +51,17 @@ This document defines the canonical Phase 2 feature contract written to `feature
 - `trade_count_z_20`: z-score(trade_count, 20 bars), default `0.0`
 - `vwap_dev_bps`: `(close - vwap) / vwap * 10000`, default `0.0`
 
+### Daily levels
+
+Computed by grouping candles by trading day (9:30-16:00 ET).
+
+- `day_high`: running high of the current trading day up to this bar, default `0.0`
+- `day_low`: running low of the current trading day up to this bar, default `0.0`
+- `prev_day_high`: previous completed trading day's high, default `0.0`
+- `prev_day_low`: previous completed trading day's low, default `0.0`
+
+Used as enhancement filters across multiple strategies (S/R levels, breakout confirmation), not as standalone signals.
+
 ### Session and time
 
 - `minute_of_day`: minutes from 00:00 ET at bar close, default `0`
@@ -83,6 +94,25 @@ Aggregation: `weighted_mean = sum(score * relevancy) / sum(relevancy)`.
 - `headline_impact_max_1d`: max absolute relevancy-weighted sentiment in 1d, default `0.0`
 - `time_since_last_news_min`: minutes since latest tagged article, default `99999.0`
 
+### Two-tiered sentiment design
+
+FinBERT provides the numeric features above (Tier 1: bulk scoring). In Phase 3, the Signal Agent LLM also receives the top 3-5 most recent/relevant raw headlines as text (Tier 2: contextual audit). This lets the LLM catch nuance FinBERT misses (e.g. "beat earnings but lowered guidance" scored positive by FinBERT, correctly read as bearish by LLM).
+
+The raw headline text is NOT stored in `feature_json`. It is queried from `news_raw` at Signal Agent prompt construction time.
+
+## Feature count summary
+
+- Price/returns: 5
+- Trend/momentum: 9
+- Volatility/range: 4
+- Volume/liquidity: 4
+- Daily levels: 4
+- Session/time: 3
+- Cross-sectional: 1
+- Regime: 2
+- Sentiment: 10
+- **Total: 42 numeric/categorical features**
+
 ## Example `feature_json` (minimal)
 
 ```json
@@ -94,6 +124,10 @@ Aggregation: `weighted_mean = sum(score * relevancy) / sum(relevancy)`.
   "atr_14": 0.84,
   "vol_z_20": 1.1,
   "vwap_dev_bps": 4.7,
+  "day_high": 214.20,
+  "day_low": 212.50,
+  "prev_day_high": 215.00,
+  "prev_day_low": 211.80,
   "minute_of_day": 605,
   "regime_trend": "up",
   "regime_vol": "medium",

@@ -1,17 +1,17 @@
 ---
 title: Full-Stack Spec — SPAI500 Trading System
-date: 2026-03-28
+date: 2026-03-29
 ---
 
-# Full-Stack Spec: SPAI500 Trading System (v3)
+# Full-Stack Spec: SPAI500 Trading System (v4)
 
-This doc describes the full stack for the SPAI500 automated intraday stock trading system: deterministic feature pipeline, LLM-powered agents, broker integration, and hard-cap enforcement.
+This doc describes the full stack for the SPAI500 automated intraday stock trading system: deterministic feature pipeline, 22 strategy engine, LLM-powered agents, broker integration, hard-cap enforcement, and future ML upgrades.
 
 Canonical references:
 - `docs/SERVICES_AND_ROADMAP.md` — provider choices and phased rollout
 - `docs/AGENT_SPEC_AND_IO.md` — per-layer inputs, outputs, cadence, token budgets
 - `docs/OPENROUTER_MODEL_SHORTLIST.md` — per-agent model matrix with costs
-- `docs/FEATURE_SPEC_V1.md` — feature contract for `features.feature_json`
+- `docs/FEATURE_SPEC_V1.md` — feature contract for `features.feature_json` (42 keys)
 - `docs/SENTIMENT_DESIGN.md` — FinBERT sentiment pipeline design
 
 ---
@@ -19,41 +19,52 @@ Canonical references:
 ## 1. High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  FRONTEND (Next.js — future)                                                │
-│  Dashboard • Charts • Positions • Signals • Risk limits • Kill switch      │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  BACKEND API (FastAPI)                                                       │
-│  /market/*  /signals/*  /risk/*  /orders/*  /positions/*  /config/*          │
-└─────────────────────────────────────────────────────────────────────────────┘
-          │                │                │                │
-          ▼                ▼                ▼                ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│ PostgreSQL17 │  │    Redis     │  │  Alpaca APIs │  │  OpenRouter  │
-│  (state DB)  │  │  (later)     │  │  (data+exec) │  │  (LLM)      │
-└──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
-          ▲                ▲                ▲                ▲
-          │                │                │                │
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                                                              │
-│  FEATURE PIPELINE (deterministic Python + FinBERT, no OpenRouter cost)      │
-│  candles_5m + news_raw → technical indicators + sentiment → features table  │
-│                                                                              │
-│  SIGNAL AGENT (LLM) → reads features → produces signals                    │
-│  RISK AGENT (LLM) → reads signals + account state → proposed_orders        │
-│  EXECUTION LAYER (mostly deterministic) → send-time checks → broker        │
-│  HARD-CAP LAYER (deterministic) → 3u/trade, 7u/day, consec-loss cooldown  │
-│                                                                              │
-│  POST-LOSS REVIEWER (async LLM) — triggers after halt / EOD               │
-│  STRATEGY RESEARCHER (async LLM, optional)                                  │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
++---------------------------------------------------------------------------------+
+|  FRONTEND (Next.js — future)                                                    |
+|  Dashboard - Charts - Positions - Signals - Risk limits - Kill switch           |
++---------------------------------------------------------------------------------+
+                                      |
+                                      v
++---------------------------------------------------------------------------------+
+|  BACKEND API (FastAPI)                                                          |
+|  /market/*  /signals/*  /risk/*  /orders/*  /positions/*  /config/*             |
++---------------------------------------------------------------------------------+
+          |                |                |                |
+          v                v                v                v
++--------------+  +--------------+  +--------------+  +--------------+
+| PostgreSQL17 |  |    Redis     |  |  Alpaca APIs |  |  OpenRouter  |
+|  (state DB)  |  |  (later)     |  |  (data+exec) |  |  (LLM)      |
++--------------+  +--------------+  +--------------+  +--------------+
+          ^                ^                ^                ^
+          |                |                |                |
++---------------------------------------------------------------------------------+
+|                                                                                 |
+|  FEATURE PIPELINE (deterministic Python + FinBERT, no OpenRouter cost)          |
+|  candles_5m + news_raw -> 42 features -> features table                         |
+|                                                                                 |
+|  22 STRATEGY ENGINE (deterministic) -> trigger signals + confluence scores      |
+|  [Future: Meta-Classifier (XGBoost) -> meta_confidence score]                   |
+|  [Future: TFT Sidecar -> multi-horizon forecasts added to features]             |
+|                                                                                 |
+|  SIGNAL AGENT (LLM) -> reads features + triggers + headlines -> signals         |
+|  RISK AGENT (LLM) -> reads signals + account state -> proposed_orders           |
+|  [Future: DRL Shadow -> shadow sizing logged alongside LLM decisions]           |
+|  EXECUTION LAYER (mostly deterministic) -> send-time checks -> broker           |
+|  HARD-CAP LAYER (deterministic) -> 3u/trade, 7u/day, consec-loss cooldown      |
+|                                                                                 |
+|  POST-LOSS REVIEWER (async LLM) — triggers after halt / EOD                    |
+|  STRATEGY RESEARCHER (async LLM, optional)                                      |
+|                                                                                 |
++---------------------------------------------------------------------------------+
 ```
 
-**Key architectural principle**: Deterministic work (feature computation, FinBERT sentiment, risk enforcement) is handled by code pipelines. LLM agents handle only the tasks that benefit from reasoning: signal interpretation, trade selection/sizing, loss review, and strategy research.
+**Key architectural principles:**
+- Deterministic work (features, sentiment, risk enforcement, strategy evaluation) is handled by code pipelines.
+- LLM agents handle only reasoning tasks: signal interpretation, trade selection/sizing, loss review.
+- Strategies are "pre-digested logic" — deterministic code does the math, LLM synthesizes and decides.
+- Two-tiered sentiment: FinBERT for bulk numeric scoring, LLM reads raw headlines for contextual audit.
+- Confluence scoring handles strategy interconnections; meta-classifier (future) learns optimal combinations.
+- Hard caps are always outside any ML model — DRL, TFT, or LLM can never bypass them.
 
 Two execution modes:
 - **Auto**: Execution layer sends orders immediately when all checks pass.
@@ -73,7 +84,8 @@ Two execution modes:
 | News | Alpaca News API | REST + WebSocket (Benzinga via Alpaca) |
 | Sentiment | FinBERT (`ProsusAI/finbert`, local) | Article-level scoring, no API cost |
 | Execution | Alpaca Trading API | Paper first, then live |
-| LLM | OpenRouter (per-agent models) | GPT-4.1 (Signal/Risk), Claude Sonnet (Post-Loss), Gemini Flash (fallback) |
+| LLM | OpenRouter (per-agent models) | GPT-4.1, DeepSeek V3.2, Claude Sonnet, Gemini |
+| Future ML | TFT (local), XGBoost (local), SAC/DRL (Stable-Baselines3) | Phases B1/B2/C |
 | Deploy | Local-first | Self-host; Vercel (frontend) + Railway (backend) later |
 
 ---
@@ -86,12 +98,12 @@ Full schema lives in `db/schema.sql`. Key tables by domain:
 - `instruments` — symbol universe (PK: symbol; asset_type, exchange, is_active)
 - `candles_5m` — 5m OHLCV bars (PK: symbol, ts, feed; Alpaca fields: o/h/l/c/v/vw/n)
 - `news_raw` — raw news articles (PK: provider, news_id)
-- `news_symbol_map` — news ↔ symbol many-to-many
+- `news_symbol_map` — news <-> symbol many-to-many
 - `ingestion_runs` — job audit log
 - `ingestion_errors` — dead-letter queue
 
 **Feature pipeline outputs:**
-- `features` — per-symbol, per-time features from deterministic pipeline
+- `features` — per-symbol, per-time features (42 keys in feature_json v1)
 - `news_sentiment_cache` — per-article FinBERT scores (cached for reuse)
 
 **Signal pipeline (LLM):**
@@ -99,7 +111,7 @@ Full schema lives in `db/schema.sql`. Key tables by domain:
 
 **Risk & execution:**
 - `risk_config` — global and per-symbol limits (key-value JSONB)
-- `promotion_gates` — paper → live → margin progression gates
+- `promotion_gates` — paper -> live -> margin progression gates
 - `proposed_orders` — Risk Agent output (size_u, confidence_bucket, reasoning_json)
 - `orders` — broker orders (execution layer sends, tracks fills/slippage)
 - `positions` — open risk snapshot
@@ -115,17 +127,17 @@ The feature pipeline is deterministic Python code. It writes to the `features` t
   - `features.symbol` = ticker
   - `features.ts` = exact 5-minute boundary in UTC
   - `features.feature_set_version` = `v1`
-  - `features.feature_json` = flat JSON object of numeric/categorical features
+  - `features.feature_json` = flat JSON object of 42 numeric/categorical features
+- **Feature groups:** price/returns (5), trend/momentum (9), volatility (4), volume (4), daily levels (4), session (3), cross-sectional (1), regime (2), sentiment (10)
 - **Sentiment pipeline**
-  - FinBERT (`ProsusAI/finbert`) scores each article (headline + summary)
-  - Scores cached in `news_sentiment_cache`
-  - Window aggregates (30m, 2h, 1d) with relevancy weighting joined into `feature_json`
+  - Tier 1: FinBERT (`ProsusAI/finbert`) scores each article (headline + summary) -> cached in `news_sentiment_cache` -> window aggregates in `feature_json`
+  - Tier 2: Signal Agent receives top 3-5 raw headlines at prompt time (contextual audit)
 - **Anti-lookahead rules**
   - At bar `ts`, only use candles/news with timestamps `<= ts`
   - No forward-fill from future bars
   - Session/window features are computed from data available at decision time
 - **Signal Agent handoff contract**
-  - Signal Agent reads only finalized `feature_set_version = 'v1'`
+  - Signal Agent reads finalized `feature_set_version = 'v1'` + 22 strategy triggers + confluence
   - Missing sentiment windows must be explicit defaults (not nulls)
   - All timestamps are UTC and aligned to `:00/:05/:10/...`
 
@@ -162,25 +174,34 @@ The feature pipeline is deterministic Python code. It writes to the `features` t
 
 ### Layer 0 — Feature Pipeline (deterministic, no LLM)
 
-- Computes technical indicators (EMA, RSI, MACD, ATR, volume z-scores, etc.) from `candles_5m`
+- Computes 42 features (EMA, RSI, MACD, ATR, volume z-scores, daily levels, etc.) from `candles_5m`
 - Runs FinBERT sentiment scoring on `news_raw` articles (local inference, CPU)
 - Aggregates sentiment into time windows with relevancy weighting
 - Writes versioned rows to `features` table
 - Cadence: runs after each 5m bar close (incremental) + historical backfill (one-time)
 
+### Layer 0.5 — 22 Strategy Engine (deterministic, no LLM)
+
+- Evaluates 22 strategies per bar per symbol using `feature_json`
+- Each strategy returns a trigger signal (1 = long, -1 = short, 0 = no trigger)
+- Computes confluence scores (long_count, short_count, confluence_score)
+- Tracks theoretical trigger outcomes for alpha decay detection
+- Cadence: runs after feature pipeline completes
+
 ### Layer 1 — Signal Agent (LLM-powered)
 
-- Reads pre-computed `features` for all active symbols
-- Reasons about trade candidates across multiple strategies
+- Reads features + strategy triggers + confluence + top raw headlines
+- Reasons about trade candidates: synthesizes strategy triggers, news context, regime
 - Produces directional signals with confidence, strategy attribution, and explanation
-- Primary model: `openai/gpt-4.1`
-- Cadence: every 5m bar close, after feature pipeline
+- Primary model: `openai/gpt-4.1` (budget: `deepseek/deepseek-v3.2`)
+- Cadence: every 5m bar close, after strategy engine
 
-### Layer 2 — Risk Agent (LLM-powered)
+### Layer 2 — Risk Agent (LLM-powered, DRL shadow alongside)
 
 - Reads `signals` + account state + risk config + rolling performance stats
-- Selects best actionable candidate(s), determines position sizing (0u–3u)
+- Selects best actionable candidate(s), determines position sizing (0u-3u)
 - Produces explicit "why this trade / why this size" reasoning
+- DRL shadow (Phase C): logs shadow sizing for comparison, trains on real outcomes
 - Primary model: `openai/gpt-4.1`
 - Cadence: after Signal Agent
 
@@ -195,14 +216,15 @@ The feature pipeline is deterministic Python code. It writes to the `features` t
 
 - Runs AFTER execution layer, before final broker submission
 - Max 3u risk per trade
-- Max 7u daily loss → halt_for_day
-- Max consecutive losses (default: 3) → cooldown
-- Pure code — no LLM, no override possible
+- Max 7u daily loss -> halt_for_day
+- Max consecutive losses (default: 3) -> cooldown
+- Pure code — no LLM, no override possible. DRL/TFT/meta-classifier cannot bypass.
 
 ### Async — Post-Loss Reviewer (LLM)
 
 - Triggers after daily halt or EOD
 - Analyzes losses, proposes rule/model/data improvements
+- Includes alpha decay detection from theoretical trigger stats
 - Primary model: `anthropic/claude-sonnet-4.5`
 
 ### Async — Strategy Researcher (optional, LLM)
@@ -216,7 +238,7 @@ The feature pipeline is deterministic Python code. It writes to the `features` t
 
 - **Option A — Inside the backend**: Pipeline + agents as FastAPI background tasks or APScheduler jobs. Simple; good for one server.
 - **Option B — Separate workers**: Each layer as a separate Python process. Better for isolation.
-- **Option C — Queue-driven**: Pipeline enqueues features → Signal Agent consumes → Risk Agent → Execution. Best for reliability.
+- **Option C — Queue-driven**: Pipeline enqueues features -> Signal Agent consumes -> Risk Agent -> Execution. Best for reliability.
 
 Start with **Option A**; move to B or C when needed.
 
@@ -232,18 +254,20 @@ Start with **Option A**; move to B or C when needed.
    - [ ] News ingestion (realtime websocket stream)
    - [x] Quality checks on bar data
 
-2. **Phase 2 — Feature Pipeline + Sentiment + Backtest** *(active)*
-   - Feature pipeline: technical indicators → `features` table
-   - FinBERT sentiment scoring → `news_sentiment_cache` + aggregates in `feature_json`
-   - Feature QA: coverage, distributions, anomaly checks
-   - Local backtesting: 3 strategy families with realistic costs
+2. **Phase 2 — Feature Pipeline + Sentiment + 22-Strategy Backtester** *(active)*
+   - [x] Feature pipeline: 42 features -> `features` table
+   - [x] FinBERT sentiment scoring -> `news_sentiment_cache`
+   - [ ] Add 4 daily-level features (day_high, day_low, prev_day_high, prev_day_low)
+   - [ ] Feature QA: coverage, distributions, anomaly checks
+   - [ ] 22-strategy backtester with ATR-based exits, per-symbol tracking, confluence scoring, theoretical trigger tracking
+   - [ ] Run backtests on walk-forward test split, review results
 
 3. **Phase 3 — Signal Agent**
-   - LLM reads features, produces `signals` rows
+   - LLM reads features + 22 strategy triggers + confluence + raw headlines -> produces `signals`
    - Strategy attribution and explanation in `meta`
 
 4. **Phase 4 — Risk Agent**
-   - LLM-driven ranking/sizing → `proposed_orders`
+   - LLM-driven ranking/sizing -> `proposed_orders`
    - Store `risk_checks`, `reject_reason`, `reasoning_json`
 
 5. **Phase 5 — Execution Layer + Hard-Cap**
@@ -254,26 +278,41 @@ Start with **Option A**; move to B or C when needed.
 
 6. **Phase 6 — Post-Loss Reviewer**
    - Trigger on daily halt or EOD
-   - Generate review artifacts
+   - Generate review artifacts with alpha decay flags
 
-7. **Phase 7 — Backend API + Frontend**
-   - FastAPI routes for all domains
-   - Next.js dashboard: signals, positions, P/L, risk config, kill switch
+7. **Phase B1 — Meta-Classifier** *(after backtest data exists)*
+   - Train XGBoost/LightGBM on strategy trigger combinations + regime + outcomes
+   - Output: meta_confidence score consumed by Signal Agent
 
-8. **Phase 8 — Go Live**
-   - Switch Alpaca paper → live (micro-size)
-   - Monitor execution realism (slippage, partial fills, rejects)
+8. **Phase B2 — TFT Sidecar** *(after architecture stable)*
+   - Train Temporal Fusion Transformer on historical feature sequences
+   - Output: multi-horizon forecasts added to feature pipeline
+
+9. **Phase C — DRL Shadow** *(from day 1 of paper/live trading)*
+   - SAC agent trains in shadow mode alongside LLM Risk Agent
+   - Logs shadow sizing vs actual sizing vs outcome
+
+10. **Phase 7 — Backend API + Frontend**
+    - FastAPI routes for all domains
+    - Next.js dashboard: signals, positions, P/L, risk config, kill switch
+
+11. **Phase 8 — Go Live**
+    - Switch Alpaca paper -> live (micro-size)
+    - Monitor execution realism (slippage, partial fills, rejects)
+
+12. **Phase D — DRL Active Promotion** *(manual decision after 500+ shadow trades)*
+    - Promote DRL to active sizing if shadow record is convincing
 
 ---
 
 ## 8. Summary
 
-- **Full stack** = FastAPI backend + PostgreSQL 17 + deterministic feature pipeline (FinBERT + technical indicators) + LLM-powered agents (Signal, Risk, Post-Loss, Strategy Research) + Alpaca (data + news + execution) + OpenRouter (LLM routing) + external hard-cap layer + (future) Next.js dashboard
-- **Feature Pipeline** computes all deterministic work (indicators + FinBERT sentiment) — no LLM cost
-- **Signal Agent** reads features, reasons about direction/confidence/strategy → `signals`
-- **Risk Agent** selects best trade, sizes it (0u–3u) with explicit reasoning → `proposed_orders`
-- **Execution Layer** runs send-time checks → sends to broker
-- **Hard-Cap Layer** enforces 3u/trade, 7u/day, consecutive-loss cooldown — not inside any agent
-- **Post-Loss Reviewer** analyzes losses and proposes improvements (async)
-- **Strategy Researcher** researches strategy performance (optional, async)
-- Build order: DB/ingestion → features/sentiment → signals → sizing → execution → review → UI → live
+- **Full stack** = FastAPI backend + PostgreSQL 17 + deterministic feature pipeline (42 features, FinBERT + technical indicators) + 22 deterministic strategy engine + LLM-powered agents (Signal, Risk, Post-Loss, Strategy Research via OpenRouter) + Alpaca (data + news + execution) + external hard-cap layer + (future) TFT sidecar + meta-classifier + DRL shadow + Next.js dashboard
+- **Feature Pipeline** computes all deterministic work (42 features + FinBERT sentiment) — no LLM cost
+- **22 Strategy Engine** evaluates deterministic strategies, produces trigger signals + confluence — "pre-digested logic" for the LLM
+- **Signal Agent** reads features + triggers + headlines, reasons about direction/confidence/strategy -> `signals`
+- **Risk Agent** selects best trade, sizes it (0u-3u) with explicit reasoning -> `proposed_orders`
+- **DRL Shadow** (future) trains alongside, never controls until manually promoted
+- **Execution Layer** runs send-time checks -> sends to broker
+- **Hard-Cap Layer** enforces 3u/trade, 7u/day, consecutive-loss cooldown — not inside any agent, not bypassable by any model
+- Build order: DB/ingestion -> features/sentiment/backtester -> signals -> sizing -> execution -> review -> ML upgrades -> UI -> live

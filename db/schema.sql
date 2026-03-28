@@ -110,7 +110,7 @@ create table if not exists public.ingestion_runs (
     id              bigint generated always as identity primary key,
     job_type        text not null check (job_type in (
                         'bars_backfill','bars_realtime','news_backfill','news_stream',
-                        'sentiment_scoring'
+                        'sentiment_scoring','feature_build'
                     )),
     symbol          text,
     started_at      timestamptz not null default now(),
